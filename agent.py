@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import time
 from datetime import datetime, timezone
@@ -6,10 +7,18 @@ from datetime import datetime, timezone
 import requests
 from dotenv import load_dotenv
 
+from logging_config import configure_logging
+
 load_dotenv()
+
+
+
+logger = logging.getLogger(__name__)
 
 OLLAMA_ENDPOINT = os.getenv("OLLAMA_ENDPOINT")
 MODEL = os.getenv("MODEL")
+
+print(f"Loaded Ollama endpoint: {OLLAMA_ENDPOINT}")
 
 if not OLLAMA_ENDPOINT:
     raise RuntimeError("OLLAMA_ENDPOINT is missing from the .env file.")
@@ -114,23 +123,33 @@ def ask_llm(prompt: str) -> dict:
         "stream": False,
     }
 
+    logger.info("Calling model %s (prompt length %d)", MODEL, len(prompt))
+
     start = time.perf_counter()
 
-    response = requests.post(
-        f"{OLLAMA_ENDPOINT}/api/generate",
-        json=payload,
-        timeout=120,
-    )
+    try:
+        response = requests.post(
+            f"{OLLAMA_ENDPOINT}/api/generate",
+            json=payload,
+            timeout=120,
+        )
 
-    response.raise_for_status()
+        response.raise_for_status()
+    except requests.RequestException:
+        logger.exception("Call to %s failed", OLLAMA_ENDPOINT)
+        raise
 
     elapsed = time.perf_counter() - start
 
     result = response.json()
-    print("\n----- Metrics -----")
-    print(f"Total Duration : {result['total_duration'] / 1_000_000_000:.2f} sec")
-    print(f"Latency        : {elapsed:.2f} sec")
-    print("-------------------")
+
+    logger.info(
+        "Model responded in %.2f sec (model time %.2f sec, %s prompt tokens, %s output tokens)",
+        elapsed,
+        result.get("total_duration", 0) / 1_000_000_000,
+        result.get("prompt_eval_count", "?"),
+        result.get("eval_count", "?"),
+    )
 
     return result
 
@@ -160,19 +179,26 @@ Now provide a concise final answer to the user.
 
 
 def run_agent(prompt: str) -> str:
+    logger.info("Agent execution started for: %.100s", prompt)
+
     result = ask_llm(prompt)
 
     decision = parse_decision(result["response"])
 
     if decision is None:
+        logger.warning("Model returned invalid JSON: %.200s", result["response"])
         return f"Gemma returned invalid JSON: {result['response']}"
 
     action = decision.get("action")
 
+    logger.info("Model decided action: %s", action)
+
     if action == "answer":
+        logger.info("Agent execution completed without a tool call")
         return decision.get("answer", "No answer was returned.")
 
     if action != "tool":
+        logger.warning("Unknown action requested: %s", action)
         return f"Unknown action requested: {action}"
 
     tool_name = decision.get("tool_name")
@@ -181,9 +207,14 @@ def run_agent(prompt: str) -> str:
     tool_function = TOOLS.get(tool_name)
 
     if tool_function is None:
+        logger.warning("Unsupported tool requested: %s", tool_name)
         return f"Unsupported tool requested: {tool_name}"
 
+    logger.info("Executing tool %s with arguments %s", tool_name, arguments)
+
     tool_result = tool_function(arguments)
+
+    logger.info("Tool %s returned: %s", tool_name, tool_result)
 
     final_result = ask_llm_with_tool_result(
         original_prompt=prompt,
@@ -191,10 +222,14 @@ def run_agent(prompt: str) -> str:
         tool_result=tool_result,
     )
 
+    logger.info("Agent execution completed after tool call")
+
     return extract_answer(final_result["response"])
 
 
 def main():
+    configure_logging()
+
     print("Type 'exit' to stop.\n")
 
     while True:
